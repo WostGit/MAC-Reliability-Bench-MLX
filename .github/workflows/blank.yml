@@ -23,7 +23,7 @@ on:
 jobs:
   benchmark:
     runs-on: macos-26
-    timeout-minutes: 150
+    timeout-minutes: 180
 
     steps:
       - name: 📋 Checkout repository
@@ -43,8 +43,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub
-          key: mlx-qwen25-${{ inputs.model_teacher_hf }}-${{ inputs.model_student_hf }}
+          key: mlx-qwen25-v2-${{ inputs.model_teacher_hf }}-${{ inputs.model_student_hf }}
 
+      # ========================================
+      # Setup Benchmark
+      # ========================================
       - name: 📁 Setup Benchmark + Tasks + Agent
         shell: bash
         run: |
@@ -58,6 +61,7 @@ jobs:
           import time
           from typing import Dict, List
           from mlx_lm import load, generate
+          from mlx_lm.sample_utils import make_sampler
 
           models_cache = {}
 
@@ -69,12 +73,13 @@ jobs:
 
           def query_model(model_id: str, prompt: str, temp: float = 0.7) -> str:
               model, tokenizer = get_model(model_id)
+              sampler = make_sampler(temp=temp)
               response = generate(
                   model, 
                   tokenizer, 
                   prompt=prompt, 
                   max_tokens=2048, 
-                  temp=temp,
+                  sampler=sampler, 
                   verbose=False
               )
               return response
@@ -165,8 +170,12 @@ jobs:
               assert compute(-4) == -8
           EOF
           done
+
           echo "✅ Setup complete"
 
+      # ========================================
+      # Run Benchmark
+      # ========================================
       - name: 🧪 Run MAC-Reliability Benchmark (MLX)
         run: |
           python - << 'PYCODE'
@@ -179,7 +188,6 @@ jobs:
 
           console = Console()
 
-          # Import agent
           spec = importlib.util.spec_from_file_location("agent", "benchmark/agent_mlx.py")
           agent = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(agent)
@@ -209,7 +217,6 @@ jobs:
                   
                   all_results[model_id][task_path.name] = task_results
 
-          # Save reports
           results_dir = Path("benchmark/results")
           results_dir.mkdir(exist_ok=True)
 
