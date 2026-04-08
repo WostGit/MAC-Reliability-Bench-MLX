@@ -45,135 +45,128 @@ jobs:
           path: ~/.cache/huggingface/hub
           key: mlx-qwen25-${{ inputs.model_teacher_hf }}-${{ inputs.model_student_hf }}
 
-      # ========================================
-      # Setup Benchmark
-      # ========================================
       - name: 📁 Setup Benchmark + Tasks + Agent
+        shell: bash
         run: |
           mkdir -p benchmark/tasks/task_{1..8} benchmark/results
 
           cat > benchmark/agent_mlx.py << 'AGENTEOF'
-import subprocess
-import json
-import re
-from pathlib import Path
-import time
-from typing import Dict, List
-from mlx_lm import load, generate
+          import subprocess
+          import json
+          import re
+          from pathlib import Path
+          import time
+          from typing import Dict, List
+          from mlx_lm import load, generate
 
-models_cache = {}
+          models_cache = {}
 
-def get_model(model_id: str):
-    if model_id not in models_cache:
-        print(f"Loading {model_id} ...")
-        models_cache[model_id] = load(model_id)
-    return models_cache[model_id]
+          def get_model(model_id: str):
+              if model_id not in models_cache:
+                  print(f"Loading {model_id} ...")
+                  models_cache[model_id] = load(model_id)
+              return models_cache[model_id]
 
-def query_model(model_id: str, prompt: str, temp: float = 0.7) -> str:
-    model, tokenizer = get_model(model_id)
-    response = generate(
-        model, 
-        tokenizer, 
-        prompt=prompt, 
-        max_tokens=2048, 
-        temp=temp,          # <-- Fixed: use 'temp' not 'temperature'
-        verbose=False
-    )
-    return response
+          def query_model(model_id: str, prompt: str, temp: float = 0.7) -> str:
+              model, tokenizer = get_model(model_id)
+              response = generate(
+                  model, 
+                  tokenizer, 
+                  prompt=prompt, 
+                  max_tokens=2048, 
+                  temp=temp,
+                  verbose=False
+              )
+              return response
 
-def run_command(cmd: str, cwd: Path) -> Dict:
-    try:
-        r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=20)
-        return {"success": r.returncode == 0, "output": r.stdout + r.stderr}
-    except Exception as e:
-        return {"success": False, "output": str(e)}
+          def run_command(cmd: str, cwd: Path) -> Dict:
+              try:
+                  r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=20)
+                  return {"success": r.returncode == 0, "output": r.stdout + r.stderr}
+              except Exception as e:
+                  return {"success": False, "output": str(e)}
 
-def build_prompt(issue: str, repo_path: Path, history: List) -> str:
-    py_files = list(repo_path.glob("**/*.py"))[:5]
-    context = "\n\n".join([f"### {f.name}\n{f.read_text()}" for f in py_files])
-    hist = "\n".join([f"Turn {h['turn']}: {h.get('action')}" for h in history[-5:]]) or "None"
-    return f"""You are a precise coding agent. Fix the issue.
+          def build_prompt(issue: str, repo_path: Path, history: List) -> str:
+              py_files = list(repo_path.glob("**/*.py"))[:5]
+              context = "\n\n".join([f"### {f.name}\n{f.read_text()}" for f in py_files])
+              hist = "\n".join([f"Turn {h['turn']}: {h.get('action')}" for h in history[-5:]]) or "None"
+              return f"""You are a precise coding agent. Fix the issue.
 
-ISSUE: {issue}
+          ISSUE: {issue}
 
-CODEBASE:
-{context}
+          CODEBASE:
+          {context}
 
-HISTORY:
-{hist}
+          HISTORY:
+          {hist}
 
-Reply with ONLY valid JSON:
-{{
-  "thinking": "step by step reasoning",
-  "action": "edit|test|submit",
-  "target_file": "main.py",
-  "content": "full file content if edit"
-}}
-"""
+          Reply with ONLY valid JSON:
+          {{
+            "thinking": "step by step reasoning",
+            "action": "edit|test|submit",
+            "target_file": "main.py",
+            "content": "full file content if edit"
+          }}
+          """
 
-def parse_response(text: str) -> Dict:
-    try:
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        return json.loads(match.group(0)) if match else json.loads(text)
-    except:
-        return {"action": "error", "thinking": "parse failed"}
+          def parse_response(text: str) -> Dict:
+              try:
+                  match = re.search(r'\{.*\}', text, re.DOTALL)
+                  return json.loads(match.group(0)) if match else json.loads(text)
+              except:
+                  return {"action": "error", "thinking": "parse failed"}
 
-def run_agent(model_id: str, issue_desc: str, repo_path: Path, max_turns: int = 12) -> Dict:
-    history = []
-    start = time.time()
-    for turn in range(max_turns):
-        prompt = build_prompt(issue_desc, repo_path, history)
-        resp = query_model(model_id, prompt, temp=0.7)
-        action = parse_response(resp)
-        
-        history.append({"turn": turn, "action": action.get("action"), "thinking": action.get("thinking","")})
-        
-        if action.get("action") == "edit" and action.get("content"):
-            target_file = repo_path / action.get("target_file", "main.py")
-            target_file.write_text(action["content"])
-        
-        elif action.get("action") in ("test", "run_tests"):
-            res = run_command("python -m pytest -q", repo_path)
-            if res["success"]:
-                return {"success": True, "turns": turn+1, "time": time.time()-start, "history": history}
-        
-        elif action.get("action") == "submit":
-            res = run_command("python -m pytest --tb=no", repo_path)
-            return {"success": res["success"], "turns": turn+1, "time": time.time()-start, "history": history}
-        
-        time.sleep(0.3)
-    
-    final = run_command("python -m pytest --tb=no", repo_path)
-    return {"success": final["success"], "turns": max_turns, "time": time.time()-start, "history": history, "reason": "max_turns"}
+          def run_agent(model_id: str, issue_desc: str, repo_path: Path, max_turns: int = 12) -> Dict:
+              history = []
+              start = time.time()
+              for turn in range(max_turns):
+                  prompt = build_prompt(issue_desc, repo_path, history)
+                  resp = query_model(model_id, prompt, temp=0.7)
+                  action = parse_response(resp)
+                  
+                  history.append({"turn": turn, "action": action.get("action"), "thinking": action.get("thinking","")})
+                  
+                  if action.get("action") == "edit" and action.get("content"):
+                      target_file = repo_path / action.get("target_file", "main.py")
+                      target_file.write_text(action["content"])
+                  
+                  elif action.get("action") in ("test", "run_tests"):
+                      res = run_command("python -m pytest -q", repo_path)
+                      if res["success"]:
+                          return {"success": True, "turns": turn+1, "time": time.time()-start, "history": history}
+                  
+                  elif action.get("action") == "submit":
+                      res = run_command("python -m pytest --tb=no", repo_path)
+                      return {"success": res["success"], "turns": turn+1, "time": time.time()-start, "history": history}
+                  
+                  time.sleep(0.3)
+              
+              final = run_command("python -m pytest --tb=no", repo_path)
+              return {"success": final["success"], "turns": max_turns, "time": time.time()-start, "history": history, "reason": "max_turns"}
 
-print("Agent ready")
-AGENTEOF
+          print("Agent ready")
+          AGENTEOF
 
           # Create 8 tasks
           for i in {1..8}; do
             mkdir -p "benchmark/tasks/task_$i"
             cat > "benchmark/tasks/task_$i/README.md" << EOT
-Task $i: Fix the code so all tests pass.
-EOT
+          Task $i: Fix the code so all tests pass.
+          EOT
             cat > "benchmark/tasks/task_$i/main.py" << EOF
-def compute(x):
-    return x * 2   # Buggy placeholder
-EOF
+          def compute(x):
+              return x * 2   # Buggy placeholder
+          EOF
             cat > "benchmark/tasks/task_$i/test_main.py" << EOF
-from main import compute
-def test_compute():
-    assert compute(5) == 10
-    assert compute(0) == 0
-    assert compute(-4) == -8
-EOF
+          from main import compute
+          def test_compute():
+              assert compute(5) == 10
+              assert compute(0) == 0
+              assert compute(-4) == -8
+          EOF
           done
-
           echo "✅ Setup complete"
-        shell: bash
 
-      # ========================================
-      # Run the Benchmark
-      # ========================================
       - name: 🧪 Run MAC-Reliability Benchmark (MLX)
         run: |
           python - << 'PYCODE'
@@ -208,7 +201,7 @@ EOF
                   issue = (task_path / "README.md").read_text().strip()
 
                   for r in range(num_runs):
-                      console.print(f"   Run {r+1}/{num_runs} ... ", end="")
+                      console.print(f"    Run {r+1}/{num_runs} ... ", end="")
                       result = agent.run_agent(model_id, issue, task_path, max_turns)
                       task_results.append(result)
                       status = "[green]PASS[/]" if result.get("success", False) else "[red]FAIL[/]"
