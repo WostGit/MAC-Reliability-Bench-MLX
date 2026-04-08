@@ -1,0 +1,289 @@
+name: MAC-Reliability-Bench - MLX on macOS 26
+
+# ================================================
+# Ultra-verbose, fully self-contained GitHub Actions Workflow
+# Now using MLX (Apple Silicon optimized) on macos-26 runner
+# ================================================
+# Purpose:
+#   Runs the Mini-Agentic-Coding Reliability Benchmark comparing
+#   ~3B teacher vs ~0.5B distilled student using MLX + mlx-lm.
+#
+#   Focus: Reliability (consistency, error recovery, agent loops)
+#
+#   Runner: macos-26 (native Apple Silicon arm64)
+# ================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_teacher_hf:
+        description: 'HF mlx-community model for teacher (3B)'
+        required: false
+        default: 'mlx-community/Qwen2.5-3B-Instruct-4bit'
+      model_student_hf:
+        description: 'HF mlx-community model for student (0.5B)'
+        required: false
+        default: 'mlx-community/Qwen2.5-0.5B-Instruct-4bit'
+      num_runs:
+        description: 'Number of runs per task'
+        required: false
+        default: '5'
+      max_turns:
+        description: 'Max agent turns'
+        required: false
+        default: '15'
+
+jobs:
+  benchmark:
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    steps:
+      - name: 📋 Checkout repository
+        uses: actions/checkout@v4
+
+      # ========================================
+      # 1. Setup Python + MLX Environment
+      # ========================================
+      - name: 🐍 Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 📦 Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mlx-lm pyyaml pytest requests rich tabulate huggingface_hub
+
+      - name: 🔧 Cache MLX models (speeds up repeated runs)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: mlx-models-${{ runner.os }}-${{ inputs.model_teacher_hf }}-${{ inputs.model_student_hf }}
+
+      # ========================================
+      # 2. Create Benchmark Structure + Tasks
+      # ========================================
+      - name: 📁 Create self-contained benchmark files and tasks
+        run: |
+          mkdir -p benchmark/tasks/task_{1..8}
+          mkdir -p benchmark/results
+
+          cat > benchmark/agent_mlx.py << 'EOF'
+          #!/usr/bin/env python3
+          """
+          MAC-Reliability Agent using mlx-lm (Apple Silicon optimized)
+          """
+          import subprocess
+          import json
+          import re
+          from pathlib import Path
+          import time
+          from typing import Dict, List, Any
+          from mlx_lm import load, generate
+
+          # Global model cache
+          models = {}
+
+          def get_model(model_id: str):
+              if model_id not in models:
+                  print(f"Loading MLX model: {model_id}")
+                  models[model_id] = load(model_id)
+              return models[model_id]
+
+          def query_model(model_id: str, prompt: str, temperature: float = 0.7, max_tokens: int = 2048) -> str:
+              model, tokenizer = get_model(model_id)
+              response = generate(model, tokenizer, prompt=prompt, 
+                                max_tokens=max_tokens, 
+                                temperature=temperature,
+                                verbose=False)
+              return response
+
+          def run_command(cmd: str, cwd: Path) -> Dict:
+              try:
+                  result = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=30)
+                  return {"success": result.returncode == 0, "output": result.stdout + result.stderr}
+              except Exception as e:
+                  return {"success": False, "output": str(e)}
+
+          def build_prompt(issue: str, repo_path: Path, history: List[Dict]) -> str:
+              py_files = list(repo_path.glob("**/*.py"))[:6]
+              context = "\n\n".join([f"### {f.name}\n{f.read_text()}" for f in py_files])
+              
+              history_str = "\n".join([f"Turn {h.get('turn')}: {h.get('action')}" for h in history[-6:]])
+              
+              return f"""You are an expert coding agent. Fix the issue.
+
+          ISSUE: {issue}
+
+          CURRENT CODE:
+          {context}
+
+          HISTORY:
+          {history_str or "No previous actions."}
+
+          Respond ONLY with valid JSON:
+          {{
+            "thinking": "...",
+            "action": "edit|test|submit",
+            "target_file": "filename.py",
+            "content": "FULL new file content here"
+          }}
+          """
+
+          def parse_response(text: str) -> Dict:
+              try:
+                  match = re.search(r'\{.*\}', text, re.DOTALL)
+                  if match:
+                      return json.loads(match.group(0))
+                  return json.loads(text.strip())
+              except:
+                  return {"action": "error", "thinking": "JSON parse failed"}
+
+          def run_agent(model_id: str, issue_desc: str, repo_path: Path, max_turns: int = 15) -> Dict:
+              history = []
+              start_time = time.time()
+              
+              for turn in range(max_turns):
+                  prompt = build_prompt(issue_desc, repo_path, history)
+                  response_text = query_model(model_id, prompt, temperature=0.7)
+                  
+                  action = parse_response(response_text)
+                  history.append({"turn": turn, "action": action.get("action"), "thinking": action.get("thinking","")})
+                  
+                  if action.get("action") == "edit" and action.get("target_file") and action.get("content"):
+                      target = repo_path / action["target_file"]
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_text(action["content"])
+                      history[-1]["result"] = f"Edited {action['target_file']}"
+                  
+                  elif action.get("action") in ["test", "run_tests"]:
+                      test_result = run_command("python -m pytest -q", repo_path)
+                      history[-1]["result"] = test_result
+                      if test_result["success"]:
+                          return {"success": True, "turns": turn+1, "time": time.time()-start_time, "history": history}
+                  
+                  elif action.get("action") == "submit":
+                      final = run_command("python -m pytest --tb=no", repo_path)
+                      return {"success": final["success"], "turns": turn+1, "time": time.time()-start_time, "history": history}
+                  
+                  time.sleep(0.3)
+              
+              # Final check
+              final_test = run_command("python -m pytest --tb=no", repo_path)
+              return {
+                  "success": final_test["success"],
+                  "turns": max_turns,
+                  "time": time.time()-start_time,
+                  "history": history,
+                  "reason": "max_turns"
+              }
+
+          if __name__ == "__main__":
+              print("MLX Agent scaffold ready")
+          EOF
+
+          # Create 8 diverse tasks
+          for i in {1..8}; do
+            mkdir -p "benchmark/tasks/task_$i"
+            cat > "benchmark/tasks/task_$i/README.md" << EOT
+          # Task $i - Agentic Coding Challenge
+          Fix the code so all tests pass.
+          EOT
+            
+            cat > "benchmark/tasks/task_$i/main.py" << EOF
+          def compute(i):
+              return i * 2  # placeholder with bug
+          EOF
+            
+            cat > "benchmark/tasks/task_$i/test_main.py" << EOF
+          from main import compute
+          def test_compute():
+              assert compute(5) == 10
+              assert compute(0) == 0
+              assert compute(-3) == -6
+          EOF
+          done
+
+          echo "✅ Benchmark structure created with 8 tasks"
+      # ========================================
+      # 3. Run the Full Benchmark
+      # ========================================
+      - name: 🧪 Execute MAC-Reliability Benchmark with MLX
+        run: |
+          python - << 'PYCODE'
+          import subprocess
+          import json
+          from pathlib import Path
+          from datetime import datetime
+          from rich.console import Console
+          import os
+
+          console = Console()
+
+          models = [
+              "${{ inputs.model_teacher_hf }}",
+              "${{ inputs.model_student_hf }}"
+          ]
+          tasks = sorted(list(Path("benchmark/tasks").glob("task_*")))
+          num_runs = int("${{ inputs.num_runs }}")
+          max_turns = int("${{ inputs.max_turns }}")
+
+          all_results = {}
+
+          for model_id in models:
+              console.rule(f"[bold red]Testing {model_id} with MLX[/]")
+              all_results[model_id] = {}
+              
+              for task_path in tasks:
+                  console.print(f"[cyan]→ Task {task_path.name}[/]")
+                  task_results = []
+                  
+                  for run_num in range(num_runs):
+                      console.print(f"   Run {run_num+1}/{num_runs}...", end=" ")
+                      result = run_agent(model_id, task_path / "README.md".read_text(), task_path, max_turns)
+                      task_results.append(result)
+                      console.print("[green]DONE[/]" if result["success"] else "[red]FAIL[/]")
+                  
+                  all_results[model_id][task_path.name] = task_results
+
+          # Save reports
+          report = {
+              "timestamp": datetime.now().isoformat(),
+              "runner": "macos-26 + MLX",
+              "models": models,
+              "results": all_results
+          }
+
+          results_dir = Path("benchmark/results")
+          results_dir.mkdir(exist_ok=True)
+          
+          with open(results_dir / "full_report.json", "w") as f:
+              json.dump(report, f, indent=2)
+
+          # Markdown summary
+          with open(results_dir / "report.md", "w") as f:
+              f.write("# MAC-Reliability Benchmark Report (MLX on macOS 26)\n\n")
+              f.write(f"Generated: {datetime.now()}\n\n")
+              for model, data in all_results.items():
+                  total_success = sum(1 for runs in data.values() for r in runs if r["success"])
+                  total_attempts = len(data) * num_runs
+                  rate = (total_success / total_attempts) * 100
+                  f.write(f"## {model}\n")
+                  f.write(f"**Success Rate**: {rate:.1f}% ({total_success}/{total_attempts})\n\n")
+
+          console.print("[bold green]✅ Benchmark finished! Check benchmark/results/[/]")
+          PYCODE
+
+      # ========================================
+      # 4. Upload Artifacts
+      # ========================================
+      - name: 📊 Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-reliability-mlx-results
+          path: benchmark/results/
+          retention-days: 30
+
+      - name: 📋 Print Summary Report
+        run: cat benchmark/results/report.md
